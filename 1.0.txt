@@ -1,0 +1,285 @@
+
+import os
+import shutil
+import socket
+import threading
+import json
+import random
+from PySide6.QtWidgets import (QApplication, QWidget, QMainWindow, QTabWidget, QVBoxLayout,
+                               QPushButton, QTreeWidget, QTreeWidgetItem, QListWidget,
+                               QFileDialog, QProgressBar, QLabel, QHBoxLayout)
+from PySide6.QtCore import Qt, QTimer
+from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
+from cryptography.fernet import Fernet
+
+SERVICE_TYPE = "_meshshare._tcp.local."
+SHARED_FOLDER = "./shared"
+BUFFER_SIZE = 65536
+
+# ------------------------- Utilities -------------------------
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))
+    ip = s.getsockname()[0]
+    s.close()
+    return ip
+
+def format_size(size):
+    for unit in ['B','KB','MB','GB']:
+        if size < 1024: return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+# ------------------------- Peer Listener -------------------------
+class PeerListener:
+    def __init__(self):
+        self.peers = {}
+    def remove_service(self, zeroconf, type, name):
+        self.peers.pop(name,None)
+    def add_service(self, zeroconf, type, name):
+        info = zeroconf.get_service_info(type,name)
+        if info:
+            addr = socket.inet_ntoa(info.addresses[0])
+            self.peers[name]=(addr,info.port)
+    def update_service(self, zeroconf, type, name):
+        pass
+
+# ------------------------- Networking with Encryption -------------------------
+# Generate symmetric key per session
+SESSION_KEY = Fernet.generate_key()
+CIPHER = Fernet(SESSION_KEY)
+
+def handle_client(conn):
+    try:
+        request = conn.recv(1024).decode()
+        if request=="LIST":
+            files=[]
+            for f in os.listdir(SHARED_FOLDER):
+                path = os.path.join(SHARED_FOLDER,f)
+                if os.path.isfile(path):
+                    files.append({"name":f,"size":os.path.getsize(path)})
+            conn.send(json.dumps(files).encode())
+        elif request.startswith("GET "):
+            filename = request[4:]
+            path=os.path.join(SHARED_FOLDER,filename)
+            if os.path.exists(path):
+                conn.send(b"OK")
+                size=os.path.getsize(path)
+                conn.send(str(size).encode().ljust(16))
+                with open(path,"rb") as f:
+                    while chunk := f.read(BUFFER_SIZE):
+                        encrypted = CIPHER.encrypt(chunk)
+                        conn.sendall(encrypted)
+            else:
+                conn.send(b"NOTFOUND")
+    finally: conn.close()
+
+def start_server(port):
+    server = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    server.bind(("0.0.0.0",port))
+    server.listen()
+    while True:
+        conn,_ = server.accept()
+        threading.Thread(target=handle_client,args=(conn,),daemon=True).start()
+
+def list_files(peer):
+    ip,port=peer
+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.connect((ip,port))
+    s.send(b"LIST")
+    data=s.recv(65536)
+    s.close()
+    return json.loads(data.decode())
+
+def download_file(peer,filename,save_path,progress_callback):
+    ip,port=peer
+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.connect((ip,port))
+    s.send(f"GET {filename}".encode())
+    if s.recv(8)!=b"OK":
+        s.close()
+        return
+    size=int(s.recv(16).decode().strip())
+    received=0
+    with open(save_path,"wb") as f:
+        while received<size:
+            chunk = s.recv(BUFFER_SIZE)
+            if not chunk: break
+            decrypted = CIPHER.decrypt(chunk)
+            f.write(decrypted)
+            received += len(chunk)
+            progress_callback(received,size)
+    s.close()
+
+# ------------------------- Main App -------------------------
+class MeshShare(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Mesh Share")
+        self.setGeometry(200,100,1000,550)
+        os.makedirs(SHARED_FOLDER, exist_ok=True)
+
+        self.port = random.randint(50000,51000)
+        self.ip = get_local_ip()
+        self.hostname = socket.gethostname()
+
+        self.zeroconf = Zeroconf()
+        self.listener = PeerListener()
+        ServiceBrowser(self.zeroconf, SERVICE_TYPE, self.listener)
+        info = ServiceInfo(SERVICE_TYPE, f"{self.hostname}.{SERVICE_TYPE}",
+                           addresses=[socket.inet_aton(self.ip)], port=self.port)
+        self.zeroconf.register_service(info)
+        threading.Thread(target=start_server, args=(self.port,), daemon=True).start()
+
+        self.init_ui()
+        self.refresh_local_files()
+        self.start_auto_refresh()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        # Tabs
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Shared Files tab
+        self.tab_files = QWidget()
+        self.tab_files.setAcceptDrops(True)
+        self.tab_files.dragEnterEvent = self.dragEnterEvent
+        self.tab_files.dropEvent = self.dropEvent
+        self.tabs.addTab(self.tab_files,"Shared Files")
+        files_layout = QVBoxLayout(self.tab_files)
+        self.local_tree = QTreeWidget()
+        self.local_tree.setHeaderLabels(["Filename","Size"])
+        files_layout.addWidget(self.local_tree)
+        btn_layout = QHBoxLayout()
+        files_layout.addLayout(btn_layout)
+        self.btn_add_files = QPushButton("Add Files")
+        self.btn_add_files.clicked.connect(self.add_files)
+        self.btn_add_folder = QPushButton("Add Folder")
+        self.btn_add_folder.clicked.connect(self.add_folder)
+        self.btn_delete = QPushButton("Delete Selected")
+        self.btn_delete.clicked.connect(self.delete_selected)
+        btn_layout.addWidget(self.btn_add_files)
+        btn_layout.addWidget(self.btn_add_folder)
+        btn_layout.addWidget(self.btn_delete)
+
+        # Peers tab
+        self.tab_peers = QWidget()
+        self.tabs.addTab(self.tab_peers,"Peers")
+        peers_layout = QVBoxLayout(self.tab_peers)
+        self.peer_list = QListWidget()
+        self.peer_list.itemDoubleClicked.connect(self.load_peer_files)
+        peers_layout.addWidget(self.peer_list)
+
+        # Peer Files tab
+        self.tab_peer_files = QWidget()
+        self.tabs.addTab(self.tab_peer_files,"Peer Files")
+        peer_files_layout = QVBoxLayout(self.tab_peer_files)
+        self.file_tree = QTreeWidget()
+        self.file_tree.setHeaderLabels(["Filename","Size"])
+        self.file_tree.itemDoubleClicked.connect(self.download_selected)
+        peer_files_layout.addWidget(self.file_tree)
+
+        # Bottom status
+        bottom_layout = QHBoxLayout()
+        layout.addLayout(bottom_layout)
+        self.progress = QProgressBar()
+        bottom_layout.addWidget(self.progress)
+        self.status = QLabel("Ready")
+        bottom_layout.addWidget(self.status)
+
+    # ---------------- Drag-and-Drop ----------------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls(): event.accept()
+        else: event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if os.path.isfile(path):
+                shutil.copy(path, SHARED_FOLDER)
+            elif os.path.isdir(path):
+                for f in os.listdir(path):
+                    full = os.path.join(path,f)
+                    if os.path.isfile(full):
+                        shutil.copy(full, SHARED_FOLDER)
+        self.refresh_local_files()
+
+    # ---------------- Local File Management ----------------
+    def refresh_local_files(self):
+        self.local_tree.clear()
+        for f in os.listdir(SHARED_FOLDER):
+            path = os.path.join(SHARED_FOLDER,f)
+            if os.path.isfile(path):
+                item = QTreeWidgetItem([f,format_size(os.path.getsize(path))])
+                self.local_tree.addTopLevelItem(item)
+
+    def add_files(self):
+        files = QFileDialog.getOpenFileNames(self,"Select files")[0]
+        for f in files: shutil.copy(f,SHARED_FOLDER)
+        self.refresh_local_files()
+
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self,"Select folder")
+        if folder:
+            for f in os.listdir(folder):
+                full = os.path.join(folder,f)
+                if os.path.isfile(full): shutil.copy(full,SHARED_FOLDER)
+        self.refresh_local_files()
+
+    def delete_selected(self):
+        for item in self.local_tree.selectedItems():
+            fname = item.text(0)
+            os.remove(os.path.join(SHARED_FOLDER,fname))
+        self.refresh_local_files()
+
+    # ---------------- Peer Logic ----------------
+    def start_auto_refresh(self):
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_peers)
+        self.timer.start(3000)
+
+    def update_peers(self):
+        self.peer_list.clear()
+        for name in self.listener.peers:
+            self.peer_list.addItem(name)
+
+    def get_selected_peer(self):
+        item = self.peer_list.currentItem()
+        if not item: return None
+        name = item.text()
+        return self.listener.peers.get(name)
+
+    def load_peer_files(self):
+        peer = self.get_selected_peer()
+        if not peer: return
+        try:
+            files = list_files(peer)
+            self.file_tree.clear()
+            for f in files:
+                item = QTreeWidgetItem([f["name"],format_size(f["size"])])
+                self.file_tree.addTopLevelItem(item)
+        except:
+            self.status.setText("Failed to load files")
+
+    def download_selected(self,item=None):
+        peer = self.get_selected_peer()
+        if not peer: return
+        items = self.file_tree.selectedItems()
+        if not items: return
+        filename = items[0].text(0)
+        save_path, _ = QFileDialog.getSaveFileName(self,"Save file",filename)
+        if not save_path: return
+        def progress_cb(received,total):
+            self.progress.setValue(int(received/total*100))
+        threading.Thread(target=lambda: download_file(peer,filename,save_path,progress_cb),daemon=True).start()
+
+# ------------------------- Run -------------------------
+if __name__=="__main__":
+    app = QApplication([])
+    window = MeshShare()
+    window.show()
+    app.exec()
